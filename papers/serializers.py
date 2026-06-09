@@ -25,3 +25,30 @@ class QuestionPaperSerializer(serializers.ModelSerializer):
         if not data.get('questions'):
             raise serializers.ValidationError("Question paper must have at least one question.")
         return data
+
+from .models import Blueprint
+
+class BlueprintSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.ReadOnlyField(source='created_by.first_name')
+    
+    class Meta:
+        model = Blueprint
+        fields = '__all__'
+        read_only_fields = ('id', 'created_by', 'created_at', 'department', 'created_by_name')
+
+from .models import ApprovalWorkflow, Notification
+
+class ApprovalWorkflowSerializer(serializers.ModelSerializer):
+    paper_subject = serializers.ReadOnlyField(source='paper.subject')
+    submitted_by_name = serializers.ReadOnlyField(source='submitted_by.get_full_name')
+
+    class Meta:
+        model = ApprovalWorkflow
+        fields = '__all__'
+        read_only_fields = ('id', 'submitted_by', 'submitted_at', 'institution', 'submitted_by_name', 'paper_subject')
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = '__all__'
+        read_only_fields = ('id', 'created_at', 'recipient')

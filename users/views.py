@@ -5,8 +5,111 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from rest_framework.authtoken.models import Token
 from .serializers import UserSerializer
-from .models import UserProfile
+from .models import UserProfile, EmailOTP
 from .permissions import IsPrincipal
+from django.core.mail import send_mail
+from django.conf import settings as django_settings
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def send_email_otp(request):
+    """Generate and send a 6-digit OTP to the given email address."""
+    email = request.data.get('email', '').strip()
+    if not email:
+        return Response({'success': False, 'message': 'Email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    otp_code = EmailOTP.generate_otp()
+    EmailOTP.objects.create(email=email, otp=otp_code)
+
+    subject = 'ExamForge – Your Email Verification OTP'
+    message = (
+        f"Hello,\n\n"
+        f"Your ExamForge verification code is: {otp_code}\n\n"
+        f"This code is valid for 10 minutes. Do not share it with anyone.\n\n"
+        f"– ExamForge Team"
+    )
+    html_message = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;
+                background:#1a1a2e;color:#e2e8f0;padding:32px;border-radius:16px;">
+      <h2 style="color:#60a5fa;margin-bottom:8px;">ExamForge</h2>
+      <p style="color:#94a3b8;">Email Verification</p>
+      <div style="background:#0f3460;border-radius:12px;padding:24px;margin:24px 0;text-align:center;">
+        <p style="font-size:13px;color:#94a3b8;margin-bottom:8px;">Your verification code</p>
+        <h1 style="font-size:42px;font-weight:800;letter-spacing:12px;color:#60a5fa;margin:0;">
+          {otp_code}
+        </h1>
+        <p style="font-size:12px;color:#64748b;margin-top:12px;">Valid for 10 minutes</p>
+      </div>
+      <p style="font-size:12px;color:#64748b;">
+        If you didn't request this, please ignore this email.
+      </p>
+    </div>
+    """
+
+    has_email_config = bool(django_settings.EMAIL_HOST_USER)
+
+    if has_email_config:
+        # ── Production: send real email ──────────────────────────────────────
+        try:
+            send_mail(
+                subject=subject,
+                message=message,
+                from_email=django_settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                html_message=html_message,
+                fail_silently=False,
+            )
+            return Response({
+                'success': True,
+                'message': f'OTP sent to {email}',
+                'dev_mode': False,
+            }, status=status.HTTP_200_OK)
+        except Exception as exc:
+            print(f"[ExamForge] Email send failed: {exc}")
+            return Response({'success': False, 'message': f'Failed to send email: {exc}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    else:
+        # ── Dev mode: no SMTP configured → return OTP in response ───────────
+        print(f"\n{'='*50}")
+        print(f"[ExamForge OTP - DEV MODE]")
+        print(f"  Email : {email}")
+        print(f"  OTP   : {otp_code}")
+        print(f"{'='*50}\n")
+        return Response({
+            'success': True,
+            'message': f'Dev mode: OTP generated for {email}',
+            'dev_mode': True,
+            'dev_otp': otp_code,   # Only returned in dev mode (no email creds)
+        }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def verify_email_otp(request):
+    """Verify the OTP submitted by the user."""
+    email = request.data.get('email', '').strip()
+    otp_input = request.data.get('otp', '').strip()
+
+    if not email or not otp_input:
+        return Response({'success': False, 'message': 'Email and OTP are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Get the latest unused OTP for this email
+    try:
+        otp_record = EmailOTP.objects.filter(email=email, is_used=False).latest('created_at')
+    except EmailOTP.DoesNotExist:
+        return Response({'success': False, 'message': 'No OTP found for this email. Please request a new one.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not otp_record.is_valid():
+        return Response({'success': False, 'message': 'OTP has expired. Please request a new one.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if otp_record.otp != otp_input:
+        return Response({'success': False, 'message': 'Incorrect OTP. Please try again.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    otp_record.is_used = True
+    otp_record.save()
+    return Response({'success': True, 'message': 'Email verified successfully!'}, status=status.HTTP_200_OK)
+
+
 
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
@@ -23,6 +126,23 @@ def signup(request):
     if serializer.is_valid():
         user = serializer.save()
         role = user.profile.role if hasattr(user, 'profile') else 'staff'
+        
+        from .models import Institution
+        # Multi-Tenant Logic: Handle Institution Assignment
+        institution_name = request.data.get('institution_name', 'Default Institution')
+        if role == 'principal':
+            # Principal creates a new institution
+            inst, _ = Institution.objects.get_or_create(name=institution_name, defaults={'code': institution_name.upper()[:10].replace(" ", "_")})
+            user.profile.institution = inst
+            user.profile.save()
+        else:
+            # Staff joins the default institution for now, or the one specified
+            inst = Institution.objects.first()
+            if not inst:
+                inst = Institution.objects.create(name=institution_name, code="DEFAULT_INST")
+            user.profile.institution = inst
+            user.profile.save()
+
         token, _ = Token.objects.get_or_create(user=user)
         return Response({
             "success": True, 
@@ -70,9 +190,14 @@ def login_view(request):
             "message": "User not found with this email"
         }, status=status.HTTP_404_NOT_FOUND)
     
-    # Try to authenticate each user found with this email
+    # Try to authenticate each user found with this email.
+    # Prefer accounts that already have a profile, because older duplicate
+    # records can exist in the database and should not override the real one.
     user = None
-    for u in users:
+    profile_users = [u for u in users if hasattr(u, 'profile')]
+    candidates = profile_users or list(users)
+
+    for u in candidates:
         authenticated_user = authenticate(username=u.username, password=password)
         if authenticated_user:
             user = authenticated_user
@@ -152,3 +277,30 @@ def staff_accounts(request):
             'date_joined': u.date_joined.strftime('%Y-%m-%d %H:%M'),
         })
     return Response(data, status=status.HTTP_200_OK)
+
+@api_view(['GET', 'POST'])
+@permission_classes([permissions.IsAuthenticated])
+def institutions_list(request):
+    from .models import Institution
+    if request.method == 'GET':
+        institutions = Institution.objects.all().order_by('name')
+        data = [{
+            'id': inst.id,
+            'name': inst.name,
+            'code': inst.code,
+            'address': inst.address or '',
+            'user_count': inst.users.count(),
+            'created_at': inst.created_at.strftime('%Y-%m-%d'),
+        } for inst in institutions]
+        return Response(data, status=status.HTTP_200_OK)
+    
+    elif request.method == 'POST':
+        name = request.data.get('name')
+        code = request.data.get('code')
+        address = request.data.get('address', '')
+        if not name or not code:
+            return Response({'error': 'Name and code are required'}, status=status.HTTP_400_BAD_REQUEST)
+        if Institution.objects.filter(code=code).exists():
+            return Response({'error': 'Institution code already exists'}, status=status.HTTP_400_BAD_REQUEST)
+        inst = Institution.objects.create(name=name, code=code, address=address)
+        return Response({'id': inst.id, 'name': inst.name, 'code': inst.code}, status=status.HTTP_201_CREATED)

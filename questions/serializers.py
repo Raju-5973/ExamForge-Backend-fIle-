@@ -6,8 +6,8 @@ class QuestionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Question
-        fields = ('id', 'text', 'subject', 'difficulty', 'marks', 'sub_topic', 'tags', 'department', 'created_by', 'created_by_name', 'created_at')
-        read_only_fields = ('id', 'created_by', 'created_by_name', 'created_at', 'department')
+        fields = ('id', 'text', 'subject', 'difficulty', 'marks', 'unit', 'bloom_level', 'co_mapping', 'po_mapping', 'image_url', 'sub_topic', 'tags', 'department', 'created_by', 'created_by_name', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'created_by', 'created_by_name', 'created_at', 'updated_at', 'department')
 
     def validate_marks(self, value):
         if value <= 0:
