@@ -10,50 +10,59 @@ from .models import UserProfile, EmailOTP
 from .permissions import IsPrincipal
 from django.core.mail import send_mail
 from django.conf import settings as django_settings
+import json
+import urllib.request
+import os
 
 
-def _send_email_in_background(subject, message, from_email, recipient_list, html_message):
-    """Send email in a background thread using direct SMTP with detailed logging."""
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
+def _send_email_via_brevo(subject, to_email, html_content, text_content):
+    """Send email using Brevo (Sendinblue) HTTP API — works on Render free tier."""
+    api_key = os.getenv('BREVO_API_KEY', '')
+    sender_email = os.getenv('SENDER_EMAIL', 'rajukakarlapudi5973@gmail.com')
+    sender_name = os.getenv('SENDER_NAME', 'ExamForge')
 
-    host = django_settings.EMAIL_HOST
-    user = django_settings.EMAIL_HOST_USER
-    password = django_settings.EMAIL_HOST_PASSWORD
-    to_email = recipient_list[0]
+    if not api_key:
+        print("[ExamForge] ❌ BREVO_API_KEY not set!")
+        return False
 
+    payload = json.dumps({
+        "sender": {"name": sender_name, "email": sender_email},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_content,
+        "textContent": text_content,
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        'https://api.brevo.com/v3/smtp/email',
+        data=payload,
+        headers={
+            'api-key': api_key,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        },
+        method='POST',
+    )
+
+    try:
+        response = urllib.request.urlopen(req, timeout=15)
+        print(f"[ExamForge] ✅ Email sent via Brevo to {to_email} (status: {response.status})")
+        return True
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8', errors='replace')
+        print(f"[ExamForge] ❌ Brevo API error {e.code}: {error_body}")
+        return False
+    except Exception as exc:
+        print(f"[ExamForge] ❌ Brevo send failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _send_email_in_background(subject, to_email, html_content, text_content):
+    """Background thread wrapper for sending email."""
     print(f"[ExamForge] 📧 Starting email send to {to_email}")
-    print(f"[ExamForge]    Host: {host}, User: {user[:5]}***")
-
-    # Build the email
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From'] = user  # Must match Gmail authenticated account
-    msg['To'] = to_email
-    msg.attach(MIMEText(message, 'plain'))
-    msg.attach(MIMEText(html_message, 'html'))
-
-    # Try SSL (port 465) first, then TLS (port 587) as fallback
-    for port, method in [(465, 'SSL'), (587, 'TLS')]:
-        try:
-            print(f"[ExamForge]    Trying {method} on port {port}...")
-            if method == 'SSL':
-                server = smtplib.SMTP_SSL(host, port, timeout=30)
-            else:
-                server = smtplib.SMTP(host, port, timeout=30)
-                server.starttls()
-
-            server.login(user, password)
-            server.sendmail(user, [to_email], msg.as_string())
-            server.quit()
-            print(f"[ExamForge] ✅ Email sent successfully via {method}:{port} to {to_email}")
-            return  # Success — stop trying
-        except Exception as exc:
-            print(f"[ExamForge] ⚠️ {method}:{port} failed: {type(exc).__name__}: {exc}")
-            continue
-
-    print(f"[ExamForge] ❌ All SMTP methods failed for {to_email}")
+    success = _send_email_via_brevo(subject, to_email, html_content, text_content)
+    if not success:
+        print(f"[ExamForge] ❌ Email delivery failed for {to_email}")
 
 
 @api_view(['POST'])
@@ -68,13 +77,13 @@ def send_email_otp(request):
     EmailOTP.objects.create(email=email, otp=otp_code)
 
     subject = 'ExamForge – Your Email Verification OTP'
-    message = (
+    text_content = (
         f"Hello,\n\n"
         f"Your ExamForge verification code is: {otp_code}\n\n"
         f"This code is valid for 10 minutes. Do not share it with anyone.\n\n"
         f"– ExamForge Team"
     )
-    html_message = f"""
+    html_content = f"""
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;
                 background:#1a1a2e;color:#e2e8f0;padding:32px;border-radius:16px;">
       <h2 style="color:#60a5fa;margin-bottom:8px;">ExamForge</h2>
@@ -92,15 +101,13 @@ def send_email_otp(request):
     </div>
     """
 
-    has_email_config = bool(django_settings.EMAIL_HOST_USER)
+    has_brevo_key = bool(os.getenv('BREVO_API_KEY', ''))
 
-    if has_email_config:
-        # ── Production: send email in background thread ─────────────────────
-        # Gmail SMTP can be slow from cloud servers. Sending in a thread
-        # prevents gunicorn worker timeout while still delivering real emails.
+    if has_brevo_key:
+        # ── Production: send email via Brevo HTTP API in background thread ──
         thread = threading.Thread(
             target=_send_email_in_background,
-            args=(subject, message, django_settings.DEFAULT_FROM_EMAIL, [email], html_message),
+            args=(subject, email, html_content, text_content),
             daemon=True,
         )
         thread.start()
@@ -111,7 +118,7 @@ def send_email_otp(request):
             'dev_mode': False,
         }, status=status.HTTP_200_OK)
     else:
-        # ── Dev mode: no SMTP configured → return OTP in response ───────────
+        # ── Dev mode: no email API configured → return OTP in response ──────
         print(f"\n{'='*50}")
         print(f"[ExamForge OTP - DEV MODE]")
         print(f"  Email : {email}")
@@ -121,7 +128,7 @@ def send_email_otp(request):
             'success': True,
             'message': f'Dev mode: OTP generated for {email}',
             'dev_mode': True,
-            'dev_otp': otp_code,   # Only returned in dev mode (no email creds)
+            'dev_otp': otp_code,
         }, status=status.HTTP_200_OK)
 
 
