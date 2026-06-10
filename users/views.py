@@ -1,3 +1,4 @@
+import threading
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework import status, permissions
@@ -9,6 +10,22 @@ from .models import UserProfile, EmailOTP
 from .permissions import IsPrincipal
 from django.core.mail import send_mail
 from django.conf import settings as django_settings
+
+
+def _send_email_in_background(subject, message, from_email, recipient_list, html_message):
+    """Send email in a background thread to avoid blocking the request."""
+    try:
+        send_mail(
+            subject=subject,
+            message=message,
+            from_email=from_email,
+            recipient_list=recipient_list,
+            html_message=html_message,
+            fail_silently=False,
+        )
+        print(f"[ExamForge] ✅ Email sent successfully to {recipient_list}")
+    except Exception as exc:
+        print(f"[ExamForge] ❌ Background email send failed: {exc}")
 
 
 @api_view(['POST'])
@@ -50,24 +67,21 @@ def send_email_otp(request):
     has_email_config = bool(django_settings.EMAIL_HOST_USER)
 
     if has_email_config:
-        # ── Production: send real email ──────────────────────────────────────
-        try:
-            send_mail(
-                subject=subject,
-                message=message,
-                from_email=django_settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[email],
-                html_message=html_message,
-                fail_silently=False,
-            )
-            return Response({
-                'success': True,
-                'message': f'OTP sent to {email}',
-                'dev_mode': False,
-            }, status=status.HTTP_200_OK)
-        except Exception as exc:
-            print(f"[ExamForge] Email send failed: {exc}")
-            return Response({'success': False, 'message': f'Failed to send email: {exc}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # ── Production: send email in background thread ─────────────────────
+        # Gmail SMTP can be slow from cloud servers. Sending in a thread
+        # prevents gunicorn worker timeout while still delivering real emails.
+        thread = threading.Thread(
+            target=_send_email_in_background,
+            args=(subject, message, django_settings.DEFAULT_FROM_EMAIL, [email], html_message),
+            daemon=True,
+        )
+        thread.start()
+        print(f"[ExamForge] 📧 OTP email queued for {email} (background thread)")
+        return Response({
+            'success': True,
+            'message': f'OTP sent to {email}',
+            'dev_mode': False,
+        }, status=status.HTTP_200_OK)
     else:
         # ── Dev mode: no SMTP configured → return OTP in response ───────────
         print(f"\n{'='*50}")
