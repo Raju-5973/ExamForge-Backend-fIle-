@@ -13,19 +13,47 @@ from django.conf import settings as django_settings
 
 
 def _send_email_in_background(subject, message, from_email, recipient_list, html_message):
-    """Send email in a background thread to avoid blocking the request."""
-    try:
-        send_mail(
-            subject=subject,
-            message=message,
-            from_email=from_email,
-            recipient_list=recipient_list,
-            html_message=html_message,
-            fail_silently=False,
-        )
-        print(f"[ExamForge] ✅ Email sent successfully to {recipient_list}")
-    except Exception as exc:
-        print(f"[ExamForge] ❌ Background email send failed: {exc}")
+    """Send email in a background thread using direct SMTP with detailed logging."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    host = django_settings.EMAIL_HOST
+    user = django_settings.EMAIL_HOST_USER
+    password = django_settings.EMAIL_HOST_PASSWORD
+    to_email = recipient_list[0]
+
+    print(f"[ExamForge] 📧 Starting email send to {to_email}")
+    print(f"[ExamForge]    Host: {host}, User: {user[:5]}***")
+
+    # Build the email
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = user  # Must match Gmail authenticated account
+    msg['To'] = to_email
+    msg.attach(MIMEText(message, 'plain'))
+    msg.attach(MIMEText(html_message, 'html'))
+
+    # Try SSL (port 465) first, then TLS (port 587) as fallback
+    for port, method in [(465, 'SSL'), (587, 'TLS')]:
+        try:
+            print(f"[ExamForge]    Trying {method} on port {port}...")
+            if method == 'SSL':
+                server = smtplib.SMTP_SSL(host, port, timeout=30)
+            else:
+                server = smtplib.SMTP(host, port, timeout=30)
+                server.starttls()
+
+            server.login(user, password)
+            server.sendmail(user, [to_email], msg.as_string())
+            server.quit()
+            print(f"[ExamForge] ✅ Email sent successfully via {method}:{port} to {to_email}")
+            return  # Success — stop trying
+        except Exception as exc:
+            print(f"[ExamForge] ⚠️ {method}:{port} failed: {type(exc).__name__}: {exc}")
+            continue
+
+    print(f"[ExamForge] ❌ All SMTP methods failed for {to_email}")
 
 
 @api_view(['POST'])
